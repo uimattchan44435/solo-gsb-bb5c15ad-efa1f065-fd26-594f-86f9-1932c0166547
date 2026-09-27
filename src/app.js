@@ -15,6 +15,7 @@ const {
   PROTOCOL_V3,
   LATEST_PROTOCOL_VERSION,
 } = require('./lottery');
+const { replayForfeits } = require('./forfeit');
 
 const MAX_CANDIDATES = 10000;
 const MAX_CANDIDATE_LENGTH = 128;
@@ -233,7 +234,19 @@ function groupViews(groups, resultGroup) {
   return view;
 }
 
-function publicView(row, participantRows) {
+// forfeit_events row -> public event view. `replacement` is null when the
+// vacated slot was left empty (standby pool exhausted).
+function forfeitEventView(row) {
+  return {
+    seq: row.seq,
+    group: row.group_name,
+    candidate: row.candidate,
+    replacement: row.replacement,
+    forfeitedAt: row.created_at,
+  };
+}
+
+function publicView(row, participantRows, forfeitRows = []) {
   const version = row.protocol_version || PROTOCOL_V1;
 
   // v3: grouped quota draw.
@@ -264,9 +277,20 @@ function publicView(row, participantRows) {
 
     if (row.status === 'revealed') {
       const result = JSON.parse(row.result);
+      // Replay the forfeit log over the original outcome to derive the
+      // current effective winners per group (originals stay in `winners`).
+      const replay = replayForfeits(result.results, forfeitRows.map(forfeitEventView));
       view.seed = row.seed;
       view.nonce = row.nonce;
-      view.results = groups.map((g, i) => groupViews(g, result.results[i]));
+      view.results = groups.map((g, i) => {
+        const groupView = groupViews(g, result.results[i]);
+        groupView.currentWinners = replay.groups[i].currentWinners;
+        groupView.vacancies = replay.groups[i].vacancies;
+        groupView.forfeited = replay.groups[i].forfeited;
+        return groupView;
+      });
+      view.forfeits = forfeitRows.map(forfeitEventView);
+      view.forfeitCount = forfeitRows.length;
       view.revealedAt = row.revealed_at;
     }
     return view;
@@ -339,13 +363,26 @@ function buildApp(db, opts = {}) {
         SET status = 'revealed', nonce = ?, result = ?, revealed_at = ?
       WHERE id = ? AND mode = 'multiparty' AND status = 'committed'`
   );
+  const insertForfeit = db.prepare(
+    `INSERT INTO forfeit_events (draw_id, seq, group_name, candidate, replacement, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  );
+  const listForfeits = db.prepare(
+    'SELECT * FROM forfeit_events WHERE draw_id = ? ORDER BY seq ASC'
+  );
+  // Forfeit events only exist for v3 draws; other versions short-circuit to
+  // an empty log so legacy views/verification stay exactly as before.
+  const forfeitRowsFor = (row) => (
+    (row.protocol_version || PROTOCOL_V1) === PROTOCOL_V3 ? listForfeits.all(row.id) : []
+  );
 
   app.get('/', async () => ({
     name: 'verifiable-draw',
-    description: 'Commit-reveal public draw: v3 grouped-quota snapshot commitments, SHA-256 rejection-sampling Fisher-Yates per group; v1/v2 records remain verifiable',
+    description: 'Commit-reveal public draw: v3 grouped-quota snapshot commitments, SHA-256 rejection-sampling Fisher-Yates per group, sequenced forfeit/replacement log for revealed v3 draws; v1/v2 records remain verifiable',
     endpoints: {
       create: 'POST /draws',
       reveal: 'POST /draws/:id/reveal',
+      forfeit: 'POST /draws/:id/forfeits',
       status: 'GET /draws/:id',
       verifyStored: 'GET /draws/:id/verify',
       verifyIndependent: 'POST /verify',
@@ -476,7 +513,7 @@ function buildApp(db, opts = {}) {
       if (row.status === 'revealed') {
         db.exec('ROLLBACK');
         return conflict(reply, 'draw already revealed; a nonce can only be submitted once', {
-          draw: publicView(row, []),
+          draw: publicView(row, [], forfeitRowsFor(row)),
         });
       }
 
@@ -613,7 +650,7 @@ function buildApp(db, opts = {}) {
       if (row.status === 'revealed') {
         db.exec('ROLLBACK');
         return conflict(reply, 'draw already revealed', {
-          draw: publicView(row, getParticipants.all(id)),
+          draw: publicView(row, getParticipants.all(id), forfeitRowsFor(row)),
         });
       }
       const participant = getParticipant.get(id, name);
@@ -704,6 +741,90 @@ function buildApp(db, opts = {}) {
     }
   });
 
+  // ---- Forfeit a winning slot (v3, revealed draws only) -------------------
+  // A current effective winner gives up their slot. The event is appended to
+  // the draw's sequenced forfeit log inside one BEGIN IMMEDIATE transaction,
+  // and the vacated slot is refilled with the first standby in that group's
+  // original shuffle order who never won and never forfeited — or left
+  // vacant (replacement = null) when the standby pool is exhausted.
+  app.post('/draws/:id/forfeits', {
+    schema: {
+      body: {
+        type: 'object',
+        required: ['group', 'candidate'],
+        additionalProperties: false,
+        properties: {
+          group: { type: 'string', minLength: 1, maxLength: MAX_GROUP_NAME_LENGTH },
+          candidate: { type: 'string', minLength: 1, maxLength: MAX_CANDIDATE_LENGTH },
+        },
+      },
+    },
+  }, async (request, reply) => {
+    const { id } = request.params;
+    const { group: groupName, candidate } = request.body;
+
+    // BEGIN IMMEDIATE takes the write lock up front; the current-winner
+    // check, the replacement pick and the sequenced append all happen in
+    // this one transaction, so concurrent forfeits cannot interleave.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = getDraw.get(id);
+      if (!row) {
+        db.exec('ROLLBACK');
+        return notFound(reply, id);
+      }
+      const version = row.protocol_version || PROTOCOL_V1;
+      if (version !== PROTOCOL_V3) {
+        db.exec('ROLLBACK');
+        return conflict(reply, `forfeits are only supported for v3 grouped draws; this draw is ${version}`);
+      }
+      if (row.status !== 'revealed') {
+        db.exec('ROLLBACK');
+        return conflict(reply, `draw is ${row.status}; forfeits are accepted only after the reveal`);
+      }
+
+      const result = JSON.parse(row.result);
+      const events = listForfeits.all(id).map(forfeitEventView);
+      const replay = replayForfeits(result.results, events);
+      const groupState = replay.groups.find((g) => g.name === groupName);
+      if (!groupState) {
+        db.exec('ROLLBACK');
+        return badRequest(reply, `group '${groupName}' does not exist in this draw`);
+      }
+      if (!groupState.currentWinners.includes(candidate)) {
+        db.exec('ROLLBACK');
+        return conflict(
+          reply,
+          `'${candidate}' is not a current winner of group '${groupName}': 只有当前有效中奖者可以放弃`,
+          { currentWinners: groupState.currentWinners }
+        );
+      }
+
+      const replacement = groupState.nextReplacement;
+      const seq = events.length === 0 ? 1 : events[events.length - 1].seq + 1;
+      const forfeitedAt = new Date().toISOString();
+      insertForfeit.run(id, seq, groupName, candidate, replacement, forfeitedAt);
+      db.exec('COMMIT');
+
+      const currentWinners = groupState.currentWinners.filter((c) => c !== candidate);
+      if (replacement !== null) currentWinners.push(replacement);
+      return reply.code(201).send({
+        drawId: id,
+        forfeit: { seq, group: groupName, candidate, replacement, forfeitedAt },
+        group: {
+          name: groupName,
+          quota: groupState.quota,
+          currentWinners,
+          vacancies: groupState.vacancies + (replacement === null ? 1 : 0),
+        },
+        forfeitCount: seq,
+      });
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch { /* no active transaction */ }
+      throw err;
+    }
+  });
+
   // ---- Draw status --------------------------------------------------------
   app.get('/draws/:id', async (request, reply) => {
     const row = getDraw.get(request.params.id);
@@ -711,7 +832,7 @@ function buildApp(db, opts = {}) {
       return notFound(reply, request.params.id);
     }
     const participants = row.mode === 'multiparty' ? getParticipants.all(row.id) : [];
-    return publicView(row, participants);
+    return publicView(row, participants, forfeitRowsFor(row));
   });
 
   // ---- Verify a stored draw (self-consistency recompute) -----------------
@@ -737,6 +858,8 @@ function buildApp(db, opts = {}) {
         nonce: row.nonce,
         groups: JSON.parse(row.groups),
         results: stored.results,
+        // Sequenced forfeit/replacement log, replayed in order during verify.
+        forfeits: listForfeits.all(row.id).map(forfeitEventView),
       };
     } else {
       input = {
@@ -824,6 +947,22 @@ function buildApp(db, opts = {}) {
               },
             },
           },
+          // v3 forfeit/replacement log (optional): replayed in seq order
+          // against the recomputed original results.
+          forfeits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['seq', 'group', 'candidate'],
+              additionalProperties: false,
+              properties: {
+                seq: { type: 'integer', minimum: 1 },
+                group: { type: 'string', minLength: 1, maxLength: MAX_GROUP_NAME_LENGTH },
+                candidate: { type: 'string', minLength: 1, maxLength: MAX_CANDIDATE_LENGTH },
+                replacement: { type: ['string', 'null'], minLength: 1, maxLength: MAX_CANDIDATE_LENGTH },
+              },
+            },
+          },
           contributions: {
             type: 'array',
             minItems: 2,
@@ -890,9 +1029,13 @@ function checkContributions(contributions, nonce, checks, problems) {
 // Recompute the grouped snapshot digest, commitment, contribution chain and
 // per-group results. Tampering is reported per dimension (group names,
 // membership, quotas, winners/orders) so the failure reason is actionable.
+// When a forfeit log is supplied it is replayed in seq order against the
+// recomputed original results: a forfeit by anyone who is not a current
+// effective winner, a replacement that skips an earlier eligible standby,
+// and a duplicate replacement are each reported as inconsistencies.
 function verifyRecordV3(input) {
   const {
-    commitment, seed, nonce, groups, snapshotDigest, contributions, results,
+    commitment, seed, nonce, groups, snapshotDigest, contributions, results, forfeits,
   } = input;
   const problems = [];
   const checks = {};
@@ -1033,12 +1176,40 @@ function verifyRecordV3(input) {
     }
   }
 
+  // 6. Forfeit/replacement log: replay the events in seq order over the
+  //    recomputed original results (the honest baseline). Every event must
+  //    be a current-winner forfeit whose replacement is the first standby in
+  //    the group's shuffle order who never won and never forfeited.
+  let expectedCurrentWinners;
+  if (forfeits !== undefined) {
+    if (!checks.groupsValid) {
+      // No trustworthy baseline; the groupsValid problem already fails the
+      // report, so the forfeit checks are simply marked failed as well.
+      checks.forfeitsSequenceValid = false;
+      checks.forfeitsValid = false;
+    } else {
+      const replay = replayForfeits(expectedResults, forfeits);
+      checks.forfeitsSequenceValid = replay.sequenceValid;
+      checks.forfeitsValid = replay.valid;
+      problems.push(...replay.problems);
+      expectedCurrentWinners = replay.groups.map((g) => ({
+        name: g.name,
+        currentWinners: g.currentWinners,
+        vacancies: g.vacancies,
+        forfeited: g.forfeited,
+      }));
+    }
+  }
+
   return {
     valid: problems.length === 0,
     version: PROTOCOL_V3,
     ...(expectedSnapshotDigest !== undefined ? { snapshotDigest: expectedSnapshotDigest } : {}),
     checks,
-    expected: { results: expectedResults },
+    expected: {
+      results: expectedResults,
+      ...(expectedCurrentWinners !== undefined ? { currentWinners: expectedCurrentWinners } : {}),
+    },
     problems,
   };
 }

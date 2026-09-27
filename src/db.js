@@ -41,6 +41,21 @@ const PARTICIPANTS_INDEX = `
     ON participants (draw_id, position);
 `;
 
+// v4: forfeit/replacement event log for revealed v3 grouped draws. Each row
+// is one sequenced forfeit (seq is 1-based per draw); `replacement` is the
+// standby who took the vacated slot, NULL when the slot stayed vacant.
+const FORFEIT_EVENTS_TABLE = `
+  CREATE TABLE IF NOT EXISTS forfeit_events (
+    draw_id     TEXT NOT NULL REFERENCES draws(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    group_name  TEXT NOT NULL,
+    candidate   TEXT NOT NULL,
+    replacement TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (draw_id, seq)
+  );
+`;
+
 // v1 databases predate the 'committed' phase and the participants table.
 // SQLite cannot alter a CHECK constraint in place, so the draws table has to
 // be recreated; existing rows keep their (single-party) semantics.
@@ -90,6 +105,13 @@ function migrateV2ToV3(db) {
   }
 }
 
+// v4 adds the forfeit/replacement event log used by revealed v3 draws. The
+// draws table itself is untouched, so v1/v2/v3 rows keep their original
+// query/verify behaviour.
+function migrateV3ToV4(db) {
+  db.exec(FORFEIT_EVENTS_TABLE);
+}
+
 // Opens (creating if needed) the SQLite database and ensures the schema exists.
 function openDatabase(dbPath) {
   if (dbPath !== ':memory:') {
@@ -116,8 +138,13 @@ function openDatabase(dbPath) {
     migrateV2ToV3(db);
     db.exec('PRAGMA user_version = 3;');
   }
+  if (version < 4) {
+    migrateV3ToV4(db);
+    db.exec('PRAGMA user_version = 4;');
+  }
   db.exec(PARTICIPANTS_TABLE);
   db.exec(PARTICIPANTS_INDEX);
+  db.exec(FORFEIT_EVENTS_TABLE);
   return db;
 }
 

@@ -203,7 +203,11 @@ test('startup migrates a v1 database file through v2 to v3 and keeps its row ver
     assert.ok(columns.includes('protocol_version'));
     assert.ok(columns.includes('snapshot_digest'));
     assert.ok(columns.includes('groups'), 'v3 migration adds groups');
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
+    assert.ok(
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'forfeit_events'").get(),
+      'v4 migration adds the forfeit event log'
+    );
 
     const report = (await app.inject({ method: 'GET', url: '/draws/pre-v3-draw/verify' })).json();
     assert.equal(report.valid, true);
