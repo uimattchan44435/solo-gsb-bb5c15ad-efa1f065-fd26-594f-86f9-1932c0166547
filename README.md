@@ -1,25 +1,28 @@
 # verifiable-draw
 
-可验证的公开抽签 API：承诺-揭示（commit-reveal）协议 + 基于 SHA-256 拒绝采样的 Fisher-Yates 洗牌，保证中奖顺序**无偏、可复算、可审计**。当前版本（**v3 协议**）以**有序分组名额**建模：创建抽签时提交 `groups`（每组含唯一 `name`、非空且全局不重复的 `candidates`、不超过本组人数的非负 `quota`，总名额至少 1），承诺把**组名、组顺序、各组归属候选与 quota** 全部绑进快照——任何一项改动都会使校验失败；揭示后每组独立洗牌，返回各组的顺序与中奖者。支持两种熵来源：
+可验证的公开抽签 API：承诺-揭示（commit-reveal）协议 + 基于 SHA-256 拒绝采样的 Fisher-Yates 洗牌，保证中奖顺序**无偏、可复算、可审计**。当前版本（**v3 协议**）以**有序分组名额**建模：创建抽签时提交 `groups`（每组含唯一 `name`、非空且全局不重复的 `candidates`、不超过本组人数的非负 `quota`，总名额至少 1），承诺把**组名、组顺序、各组归属候选与 quota** 全部绑进快照——任何一项改动都会使校验失败；揭示后每组独立洗牌，返回各组的顺序与中奖者。**已揭示的 v3 抽签支持中奖者放弃与候补递补**：每次放弃在事务中追加一条带序号的事件，按该组洗牌顺序选首位未中奖且未放弃者递补（候补耗尽则名额空缺），事件日志可重放审计。支持两种熵来源：
 
 - **单 nonce 模式**（兼容旧流程）：调用方揭示一次公共 nonce。
 - **多人承诺模式**：创建抽签时声明参与者名单，每人先提交 `SHA-256(secret)` 承诺、再揭示 secret；全部揭示后，服务端按**固定参与者顺序**拼接各人 secret 的哈希作为 nonce。任一方都无法单独左右结果，整条贡献链可审计。
 
-v1 / v2 旧记录（扁平 `candidates`/`count`）升级后**继续可查可验**，校验时按记录持久化的协议版本自动选择对应算法。
+v1 / v2 旧记录（扁平 `candidates`/`count`）升级后**继续可查可验**，校验时按记录持久化的协议版本自动选择对应算法；放弃/递补仅适用于 v3 抽签，v1/v2 记录开奖即终态。
 
 技术栈：Node.js 24 + Fastify 5 + SQLite（Node 内置 `node:sqlite`，零原生依赖）。
 
 ## 一键启动（Docker Compose）
 
+单条命令构建并启动（首次启动自动建表，无需手动迁移）：
+
 ```bash
 docker compose up --build
 ```
 
-服务地址：**http://localhost:3000** （容器映射端口 `3000:3000`；首次启动自动建表，无需手动迁移）。旧版数据库在启动时自动迁移：
+服务地址：**http://localhost:3000** （容器映射端口 `3000:3000`）。旧版数据库在启动时自动逐级迁移：
 
 - v0 → v1：重建 `draws` 表以支持多人承诺阶段；
 - v1 → v2：`draws` 表增加 `protocol_version` / `snapshot_digest` 两列；
-- v2 → v3：`draws` 表增加 `groups` 列（v3 分组定义 JSON），旧行该列为空，仍按其原版本（v1/v2）验证，**可查可验不受影响**。
+- v2 → v3：`draws` 表增加 `groups` 列（v3 分组定义 JSON），旧行该列为空，仍按其原版本（v1/v2）验证，**可查可验不受影响**；
+- v3 → v4：新增 `forfeit_events` 表（v3 已揭示抽签的放弃/递补事件日志），既有抽签与结果不受影响。
 
 常用命令：
 
@@ -88,6 +91,17 @@ SQLite 数据通过 compose 的命名卷 `draw-data` 持久化。
    - **最后一个揭示在同一事务内**：按创建时的固定参与者顺序拼接 `SHA-256(secret_i)` 得到 nonce（每段固定 64 hex，无分隔符、无歧义），对每组复用同一套洗牌算法算出结果并落库、揭示 seed。
 3. **审计**：完成后的响应（及 `GET /draws/:id`）包含 `contributions` 列表——每位参与者的位置、承诺、secret、secret 哈希与两个时间戳。任何人都能用它重新拼出 nonce，再通过 `/verify` 独立复算。
 
+### 放弃与递补（仅已揭示的 v3 抽签）
+
+揭示之后，任何**当前有效中奖者**都可以放弃名额，服务端按确定性规则递补：
+
+1. **提交放弃**：`POST /draws/:id/forfeits`，请求体 `{"group": "<组名>", "candidate": "<候选名>"}`。只有该组**当前有效**中奖者能放弃（原始中奖者或已递补上任者）；从未中奖、已放弃或他组候选一律 `409`。
+2. **事务内追加事件**：每次放弃在 `BEGIN IMMEDIATE` 事务中向 `forfeit_events` 追加一条带**连续序号**（每抽签从 1 开始）的事件，记录组名、放弃者、递补者与时间戳；并发放弃不会交错。
+3. **确定性递补**：递补者为该组**洗牌顺序中首位从未中奖且未放弃**的候选；候补耗尽时递补者为 `null`，该名额**空缺**。
+4. **查询与审计**：`GET /draws/:id` 同时返回原始开奖结果（每组 `order`/`winners`）、当前有效中奖名单（每组 `effectiveWinners`，按名额槽位对齐，`null` 表示空缺）与放弃递补事件（`forfeits`，按序号排列）；`GET /draws/:id/verify` 按事件顺序**重放**整条日志，发现非当前中奖者放弃、跳过更靠前候补或重复递补即判定不一致。
+
+v1/v2 旧记录开奖即终态，不提供放弃接口（调用返回 `409`）。
+
 ## API
 
 ### 1. 创建抽签（v3 分组）
@@ -124,14 +138,17 @@ curl -X POST http://localhost:3000/draws/<drawId>/reveal \
               { "name": "blue", "quota": 1, "candidates": ["…"], "candidateCount": 2 } ],
   "results": [
     { "name": "red",  "quota": 2, "order": ["carol", "bob", "alice"], "winners": ["carol", "bob"],
+      "effectiveWinners": ["carol", "bob"],
       "candidates": ["alice","bob","carol"], "candidateCount": 3 },
     { "name": "blue", "quota": 1, "order": ["erin", "dave"], "winners": ["erin"],
+      "effectiveWinners": ["erin"],
       "candidates": ["dave","erin"], "candidateCount": 2 }
   ],
+  "forfeits": [],
   "revealedAt": "…" }
 ```
 
-每个结果组中 `order` 为该组全量洗牌顺序，`winners` 为其前 `quota` 名（quota 为 0 时 `winners` 为空数组）。重复揭示返回 `409`。
+每个结果组中 `order` 为该组全量洗牌顺序，`winners` 为其前 `quota` 名（quota 为 0 时 `winners` 为空数组）；`effectiveWinners` 为放弃递补后的当前有效中奖名单（刚揭示时与 `winners` 相同），`forfeits` 为放弃递补事件日志（刚揭示时为空）。重复揭示返回 `409`。
 
 ### 3. 查询状态
 
@@ -139,9 +156,9 @@ curl -X POST http://localhost:3000/draws/<drawId>/reveal \
 curl http://localhost:3000/draws/<drawId>
 ```
 
-v3 响应始终包含 `version: "v3"`、`snapshotDigest` 与有序 `groups`（含 `name`/`quota`/`candidates`/`candidateCount`），以及 `groupCount`/`totalQuota`/`candidateCount`；揭示后额外包含 `seed`、`nonce` 与 `results`（每组 `order`/`winners`）。多人抽签还包含 `participants`（每人 `status: pending|committed|revealed`、承诺与时间戳；secret 在整体揭示前不返回）及 `committedCount` / `revealedCount`。
+v3 响应始终包含 `version: "v3"`、`snapshotDigest` 与有序 `groups`（含 `name`/`quota`/`candidates`/`candidateCount`），以及 `groupCount`/`totalQuota`/`candidateCount`；揭示后额外包含 `seed`、`nonce` 与 `results`（每组 `order`/`winners`/`effectiveWinners`——最后一个为放弃递补后的当前有效中奖名单，按名额槽位对齐，`null` 表示空缺），以及按序号排列的放弃递补事件 `forfeits`（未揭示或无人放弃时为空数组）。多人抽签还包含 `participants`（每人 `status: pending|committed|revealed`、承诺与时间戳；secret 在整体揭示前不返回）及 `committedCount` / `revealedCount`。
 
-v1/v2 旧记录的响应保持原样：扁平 `candidates` + `count` + `order`/`winners`，`version` 为 `v1` 或 `v2`（v1 的 `snapshotDigest` 为 `null`）。
+v1/v2 旧记录的响应保持原样：扁平 `candidates` + `count` + `order`/`winners`，`version` 为 `v1` 或 `v2`（v1 的 `snapshotDigest` 为 `null`），不含 `forfeits`/`effectiveWinners` 字段。
 
 ### 3a. 多人模式：创建 + 承诺 + 揭示
 
@@ -198,7 +215,41 @@ curl -s -X POST http://localhost:3000/draws/$ID/participants/bob/reveal \
 | 开奖后再提交承诺/揭示（附最终 `draw`） | `409` |
 | 对多人抽签调 `/reveal`，或对单人抽签调参与者接口 | `409` |
 
-### 4. 独立校验（核心）
+### 4. 放弃与递补（仅已揭示的 v3 抽签）
+
+按「抽签 + 组名 + 候选名」提交放弃；服务端在同一事务中校验放弃者确为该组**当前有效中奖者**、追加带连续序号的事件，并按该组洗牌顺序选首位未中奖且未放弃者递补：
+
+```bash
+curl -X POST http://localhost:3000/draws/<drawId>/forfeits \
+  -H 'content-type: application/json' \
+  -d '{"group":"red","candidate":"carol"}'
+```
+
+```json
+{ "drawId": "…",
+  "event": { "seq": 1, "group": "red", "candidate": "carol",
+             "replacement": "alice", "createdAt": "…" },
+  "effectiveWinners": { "red": ["alice", "bob"], "blue": ["erin"] },
+  "forfeits": [ { "seq": 1, "group": "red", "candidate": "carol",
+                  "replacement": "alice", "createdAt": "…" } ] }
+```
+
+- `event.replacement` 为本次递补者；候补耗尽时为 `null`，该名额空缺（`effectiveWinners` 中对应槽位为 `null`）。
+- 递补上任者也是当前有效中奖者，之后同样可以放弃（事件序号连续递增）。
+- 响应中的 `effectiveWinners` 按组名给出各组当前有效中奖名单（槽位对齐）；完整事件日志见 `forfeits`，与 `GET /draws/:id` 返回的一致。
+
+错误码：
+
+| 场景 | 状态码 |
+|---|---|
+| 抽签不存在 | `404` |
+| 缺少 `group`/`candidate` 或字段为空 | `400` |
+| 组名未在该抽签中声明 | `400` |
+| 抽签尚未揭示（`pending`/`committed`） | `409` |
+| v1/v2 旧记录（开奖即终态，不支持放弃） | `409` |
+| 候选不是该组当前有效中奖者（未中奖/已放弃/他组候选；响应附当前 `effectiveWinners`） | `409` |
+
+### 5. 独立校验（核心）
 
 提交版本、承诺、seed、nonce 与快照（v3 为 `groups`；旧版为 `candidates`/`count`），服务端按版本重算承诺与结果，并逐项指出篡改：
 
@@ -243,7 +294,9 @@ curl -X POST http://localhost:3000/verify \
 - `commitmentsOpen`：每条都满足 `SHA-256(secret) == commitment`；
 - `nonceDerived`：按位置顺序拼接 `SHA-256(secret)` 恰好等于 `nonce`，并用重导出的 nonce 复算各组 `order`。
 
-另外 `GET http://localhost:3000/draws/:id/verify` 可对服务端存储的记录做一致性重算：按记录持久化的 `version` 选择算法（v3 重算分组承诺与各组结果并核对存储的 `snapshotDigest`；v1/v2 走各自旧算法），多人模式自动带上 `contributions` 并检查贡献链。
+另外 `GET http://localhost:3000/draws/:id/verify` 可对服务端存储的记录做一致性重算：按记录持久化的 `version` 选择算法（v3 重算分组承诺与各组结果并核对存储的 `snapshotDigest`；v1/v2 走各自旧算法），多人模式自动带上 `contributions` 并检查贡献链。对已揭示的 v3 抽签，还会**按事件顺序重放** `forfeit_events` 日志（响应附带 `forfeits` 与 `expected.effectiveWinners`），新增校验项：
+
+- `forfeitsConsistent`：事件序号从 1 连续；每条事件的放弃者都是该组当时的当前有效中奖者；递补者恰为该组洗牌顺序中首位未中奖且未放弃者（候补耗尽为空缺）。发现**非当前中奖者放弃**、**跳过更靠前候补**、**重复递补**或序号断裂时，该校验项为 `false`，`problems` 指明是哪一个事件、哪一类不一致。
 
 ## 算法规范（第三方可独立复算）
 
@@ -284,6 +337,7 @@ curl -X POST http://localhost:3000/verify \
   每个 32 字节块按大端序切成 8 个 uint32，依次消费；不同组的块序号互不影响（每组都是独立随机流）。
 - **拒绝采样**：取 `[0, n)` 均匀整数时，令 `limit = floor(2^32 / n) * n`，丢弃 `x >= limit` 的样本，返回 `x % n`，消除模偏差。
 - **Fisher-Yates（每组）**：对该组候选副本从末尾向前，`j = uniform(i + 1)` 交换，得到该组全量顺序；前 `quota` 个为该组中奖者。所有组合并即抽签最终结果。
+- **放弃/递补重放（v3 揭示后）**：每组有 `quota` 个名额槽位，初始持有者为该组洗牌顺序的前 `quota` 名。放弃事件按序号（每抽签从 1 连续递增）逐条重放：放弃者必须是某槽位的**当前持有者**（原始中奖者或已递补上任者）；其槽位由该组洗牌顺序中**首位从未中奖且未放弃**的候选接任，无合格候补时槽位空缺（`null`）。递补者上位后同样可放弃。重放全部事件即得当前有效中奖名单——规则完全确定，任何人拿到事件日志都能独立复算并核对。
 - **旧版随机流（v1/v2 复算用）**：`block(b) = SHA-256(seed + ":" + nonce + ":" + b)`（无组序号），对扁平候选列表单次洗牌，前 `count` 个为中奖者。
 
 ## 本地开发（可选）
@@ -293,18 +347,19 @@ curl -X POST http://localhost:3000/verify \
 ```bash
 npm ci
 npm start     # http://localhost:3000
-npm test      # node:test 测试套件（含 v3 分组、多人贡献链、旧版兼容/迁移与无偏性统计检验）
+npm test      # node:test 测试套件（含 v3 分组、多人贡献链、放弃/递补、旧版兼容/迁移与无偏性统计检验）
 ```
 
 ## 项目结构
 
 ```
-src/lottery.js          v3 分组快照/承诺、各组独立 SHA-256 随机流、拒绝采样、分组 Fisher-Yates；保留 v1/v2 扁平算法与多人 secret 哈希汇聚
-src/db.js               SQLite 连接、自动建表与旧版 schema 迁移（v0 → v1 → v2 → v3；v3 增加 groups 列）
-src/app.js              Fastify 路由（v3 分组创建 / 单人揭示 / 多人承诺·揭示 / 查询 / 按版本校验 v3·v2·v1）
+src/lottery.js          v3 分组快照/承诺、各组独立 SHA-256 随机流、拒绝采样、分组 Fisher-Yates、放弃/递补事件重放；保留 v1/v2 扁平算法与多人 secret 哈希汇聚
+src/db.js               SQLite 连接、自动建表与旧版 schema 迁移（v0 → v1 → v2 → v3 → v4；v3 增加 groups 列，v4 增加 forfeit_events 事件表）
+src/app.js              Fastify 路由（v3 分组创建 / 单人揭示 / 多人承诺·揭示 / 放弃·递补 / 查询 / 按版本校验 v3·v2·v1）
 src/index.js            入口：配置、启动、优雅退出
 test/api.test.js        v3 单 nonce 端到端、分组输入校验与篡改检测
-test/groups.test.js     v3 快照格式、分组承诺、每组结果、各类篡改检测与 v2→v3 迁移
+test/groups.test.js     v3 快照格式、分组承诺、每组结果、各类篡改检测与 v2→v4 迁移
 test/multiparty.test.js v3 多人承诺模式阶段锁定、越序拒绝、贡献链汇聚与分组结果审计
-test/snapshot.test.js   v1/v2 旧记录独立校验、旧库逐级迁移到 v3 后仍可查可验
+test/forfeits.test.js   v3 放弃/递补：候补顺位、名额空缺、事件序号、仅当前中奖者可放弃、已存校验重放篡改检测、v1/v2 不受影响
+test/snapshot.test.js   v1/v2 旧记录独立校验、旧库逐级迁移到 v4 后仍可查可验
 ```

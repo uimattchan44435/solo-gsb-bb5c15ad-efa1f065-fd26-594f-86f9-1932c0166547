@@ -159,7 +159,7 @@ test('stored verify flags tampering in a legacy v2 row', async () => {
   assert.equal(report.checks.orderMatch, false);
 });
 
-test('startup migrates a v1 database file through v2 to v3 and keeps its row verifiable', async () => {
+test('startup migrates a v1 database file through v2/v3 to v4 and keeps its row verifiable', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'draws-migration-'));
   const dbPath = path.join(dir, 'draws.db');
 
@@ -203,7 +203,8 @@ test('startup migrates a v1 database file through v2 to v3 and keeps its row ver
     assert.ok(columns.includes('protocol_version'));
     assert.ok(columns.includes('snapshot_digest'));
     assert.ok(columns.includes('groups'), 'v3 migration adds groups');
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
+    db.prepare('SELECT * FROM forfeit_events LIMIT 1').all(); // v4 event log exists
 
     const report = (await app.inject({ method: 'GET', url: '/draws/pre-v3-draw/verify' })).json();
     assert.equal(report.valid, true);

@@ -189,6 +189,94 @@ function computeGroupedResult(seed, nonce, groups) {
   });
 }
 
+// ---- v3 forfeit / replacement replay --------------------------------------
+// A revealed grouped draw accepts forfeit events: a current effective winner
+// gives up their slot, and the first candidate in that group's shuffled order
+// who has never won and has not forfeited is promoted as the replacement (the
+// slot stays vacant — null — when no such standby remains). Events carry a
+// per-draw sequence number (1, 2, 3, …); replaying them in order on top of
+// the original results yields the current effective winners.
+//
+// `events` must be in stored (sequence) order, each entry shaped
+// { seq, group, candidate, replacement } with `replacement` null for a slot
+// that went vacant. Returns:
+//   effective: per-group slot arrays aligned with `groups` (null = vacant)
+//   state:     per-group replay state (slots, everWon, forfeited, order)
+//   problems:  consistency violations found while replaying — a forfeit by
+//              anyone who is not a current effective winner, a replacement
+//              that skips an earlier eligible standby, a duplicate
+//              replacement, a broken sequence, or an unknown group.
+function replayForfeits(groups, results, events) {
+  const state = groups.map((group, i) => {
+    // Tolerate a tampered/truncated stored result: the verify path reports
+    // the result problems separately; the replay just works with what is
+    // there instead of throwing.
+    const result = results && results[i] && typeof results[i] === 'object' ? results[i] : {};
+    const order = Array.isArray(result.order) ? result.order : [];
+    const winners = Array.isArray(result.winners) ? result.winners : [];
+    return {
+      name: group.name,
+      order,
+      slots: winners.slice(),
+      everWon: new Set(winners),
+      forfeited: new Set(),
+    };
+  });
+  const byName = new Map(state.map((s) => [s.name, s]));
+  const problems = [];
+
+  events.forEach((event, index) => {
+    const label = `事件 #${event.seq}`;
+    if (event.seq !== index + 1) {
+      problems.push(`forfeit sequence mismatch: 事件序号应是从 1 开始的连续序号，第 ${index + 1} 条事件的序号为 ${event.seq} — 放弃/递补事件已被篡改`);
+    }
+    const st = byName.get(event.group);
+    if (!st) {
+      problems.push(`forfeit mismatch: ${label} 引用了不存在的组 '${event.group}' — 放弃/递补事件已被篡改`);
+      return;
+    }
+    const slotIndex = st.slots.indexOf(event.candidate);
+    if (slotIndex === -1) {
+      problems.push(`forfeit mismatch: ${label} 中 '${event.candidate}' 不是组 '${event.group}' 的当前有效中奖者 — 非当前中奖者放弃，事件已被篡改`);
+      return; // a forfeit the server would have rejected changes no state
+    }
+
+    // The expected replacement: first in the group's shuffled order who has
+    // never won and has not forfeited; null when the standbys are exhausted.
+    const expected = st.order.find((c) => !st.everWon.has(c) && !st.forfeited.has(c)) ?? null;
+    if (event.replacement !== expected) {
+      const actualText = event.replacement === null ? '空缺' : `'${event.replacement}'`;
+      if (event.replacement !== null && st.everWon.has(event.replacement)) {
+        problems.push(`replacement mismatch: ${label} 的递补者 '${event.replacement}' 已经中过奖 — 重复递补，事件已被篡改`);
+      } else {
+        const expectedText = expected === null ? '空缺（候补已耗尽）' : `'${expected}'`;
+        problems.push(`replacement mismatch: ${label} 应由 ${expectedText} 递补（组 '${event.group}' 洗牌顺序中首位未中奖且未放弃者），实际记录为 ${actualText} — 跳过更靠前候补，事件已被篡改`);
+      }
+    }
+
+    // Apply the recorded event: the forfeiter leaves their slot, and a
+    // mechanically eligible recorded replacement takes it (a duplicate or
+    // out-of-group replacement is flagged above and leaves the slot vacant).
+    st.forfeited.add(event.candidate);
+    st.slots[slotIndex] = null;
+    if (
+      event.replacement !== null
+      && !st.everWon.has(event.replacement)
+      && !st.forfeited.has(event.replacement)
+      && st.order.includes(event.replacement)
+    ) {
+      st.slots[slotIndex] = event.replacement;
+      st.everWon.add(event.replacement);
+    }
+  });
+
+  return {
+    effective: state.map((s) => s.slots.slice()),
+    state,
+    problems,
+  };
+}
+
 module.exports = {
   sha256Hex,
   generateSeed,
@@ -202,6 +290,7 @@ module.exports = {
   computeOrder,
   computeGroupOrder,
   computeGroupedResult,
+  replayForfeits,
   PROTOCOL_V1,
   PROTOCOL_V2,
   PROTOCOL_V3,

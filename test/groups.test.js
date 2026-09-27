@@ -380,7 +380,7 @@ test('per-group shuffle stays unbiased (rejection sampling sanity)', () => {
   }
 });
 
-test('startup migrates a v2 database file to v3 and keeps v1/v2 rows verifiable', async () => {
+test('startup migrates a v2 database file to v4 and keeps v1/v2 rows verifiable', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'draws-migration3-'));
   const dbPath = path.join(dir, 'draws.db');
 
@@ -435,7 +435,8 @@ test('startup migrates a v2 database file to v3 and keeps v1/v2 rows verifiable'
   try {
     const columns = db.prepare('PRAGMA table_info(draws)').all().map((c) => c.name);
     assert.ok(columns.includes('groups'), 'migration adds groups');
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4);
+    db.prepare('SELECT * FROM forfeit_events LIMIT 1').all(); // v4 event log exists
 
     const v2report = (await app.inject({ method: 'GET', url: '/draws/pre-v3-v2/verify' })).json();
     assert.equal(v2report.valid, true);

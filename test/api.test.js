@@ -101,8 +101,15 @@ test('independent verify accepts honest v3 records and flags a forged seed/nonce
 
   // A forged nonce does not move the commitment (it only feeds the shuffle),
   // so supplying it alongside the honest results exposes an order mismatch.
+  // With tiny groups a different nonce can coincidentally reproduce the same
+  // shuffle, so pick a forged nonce that provably changes the outcome.
+  let forgedNonce = 'forged';
+  const honestResults = computeGroupedResult(record.seed, record.nonce, GROUPS);
+  while (JSON.stringify(computeGroupedResult(record.seed, forgedNonce, GROUPS)) === JSON.stringify(honestResults)) {
+    forgedNonce += '!';
+  }
   const badNonce = await app.inject({
-    method: 'POST', url: '/verify', payload: { ...record, nonce: 'forged' },
+    method: 'POST', url: '/verify', payload: { ...record, nonce: forgedNonce },
   });
   const badNonceBody = badNonce.json();
   assert.equal(badNonceBody.valid, false);
